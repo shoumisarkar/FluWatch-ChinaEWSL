@@ -1,0 +1,435 @@
+---
+title: "EWSL Control Charts and Comparison Maps"
+author: "Yuhang Zhou"
+date: "2024-01-01"
+output: html_document
+---
+
+## Setup
+
+```{r}
+library(shiny)
+library(ggplot2)
+library(plotly)
+library(leaflet)
+influenza_data <- readxl::read_excel("/Users/jjjooo/Dropbox (UFL)/research/EWSL project/Codes and EWSL chart/Influenza.xlsx")
+#load("/Users/zhouyuhang/Desktop/EWSL project/Codes and EWSL chart/EWSL results data/week_40_2015.RData")
+```
+
+## RShiny code
+
+```{r}
+ui <- fluidPage(
+    titlePanel("Influenza Incidence Rates in China"),
+
+    sidebarLayout(
+        sidebarPanel(
+            selectInput("yearSelect", 
+                        "Select Year:",
+                        choices = unique(influenza_data$year)),
+
+            sliderInput("weekSlider", 
+                        "Select Week:",
+                        min = 1,
+                        max = 52,  # Set a default range; this will be updated server-side
+                        value = 1),
+            width = 12  # Adjust the width of the sidebar (3 out of 12 columns)
+        ),
+
+        mainPanel(
+           leafletOutput("map", height = 600),
+           width = 12  # Adjust the width of the main panel (9 out of 12 columns)
+        )
+    )
+)
+
+server <- function(input, output, session) {
+    # Observe changes in the selected year and update the week slider's range
+    observe({
+        year <- input$yearSelect
+        max_week <- ifelse(year == 2015 || year == 2020, 53, 52)
+        updateSliderInput(session, "weekSlider", max = max_week)
+    })
+
+    output$map <- renderLeaflet({
+        # Ensure the data is filtered correctly
+        filtered_data <- influenza_data %>%
+            filter(year == input$yearSelect, week == input$weekSlider)
+
+        # Check if the filtered data is not empty
+        if(nrow(filtered_data) > 0) {
+            leaflet(filtered_data) %>%
+                addProviderTiles(providers$CartoDB.Positron) %>%
+                addCircles(lat = ~Lat, lng = ~Long, weight = 1,
+                           radius = ~sqrt(rate) * 10e6,
+                           color = "#FF0000",
+                           fillColor = "#FF0000",
+                           fillOpacity = 0.5)
+        } else {
+            leaflet() %>%
+                addProviderTiles(providers$CartoDB.Positron)
+        }
+    })
+}
+shinyApp(ui = ui, server = server)
+```
+
+## Merge PNGs together
+
+```{r}
+
+library(png)
+library(grid)
+
+img1 <- readPNG("/Users/jjjooo/Dropbox (UFL)/Screenshots/032019.png")
+img2 <- readPNG("/Users/jjjooo/Dropbox (UFL)/Screenshots/032020.png")
+height <- max(dim(img1)[1], dim(img2)[1])
+width <- dim(img1)[2] + dim(img2)[2]
+
+# Create a new plot and draw the images
+png("/Users/jjjooo/Dropbox (UFL)/Screenshots/20192020_03.png",width = width, height = height)
+grid.newpage()
+pushViewport(viewport(width = 1, height = 1))
+grid.raster(img1, x = 0.25, y = 0.5, width = 0.5)
+grid.raster(img2, x = 0.75, y = 0.5, width = 0.5)
+dev.off()
+
+```
+
+
+```{r}
+data2016 <- readRDS("reverseIC2014_2016,ARL0=150.rds")
+data2017 <- readRDS("reverseIC2015_2017,ARL0=150.rds")
+data2018 <- readRDS("reverseIC2016_2018,ARL0=150.rds")
+data2019 <- readRDS("reverseIC2017_2019,ARL0=150.rds")
+data2020 <- readRDS("reverseIC2018_2020,ARL0=150.rds")
+```
+
+## SPC plot
+
+```{r}
+library(ggplot2)
+
+# Assuming 'data2016' is your list containing SPC data
+# Extracting the cstat values for plotting for the first 12 weeks
+cstat_values <- data2016$cstat[37:52]
+weeks <- 37:52  # Creating a sequence of weeks for the first 12 weeks
+
+# Control limit (upper only since cstat won't go below zero)
+ucl <- rep(data2016$cl, length(cstat_values))
+
+# Create a data frame for ggplot for the first 12 weeks
+spc_data <- data.frame(Weeks = weeks, Cstat = cstat_values, UCL = ucl)
+
+# Generate the SPC plot from week 1 to week 25
+spc_plot <- ggplot(spc_data, aes(x = Weeks)) + 
+  geom_line(aes(y = Cstat), color = "blue") + 
+  geom_hline(aes(yintercept = UCL), linetype = "dashed", color = "red") +
+  geom_point(aes(y = Cstat, color = (Cstat > UCL))) +
+  scale_color_manual(values = c("black", "red")) +
+  scale_x_continuous(breaks = 37:52) +  # Specify x-axis breaks at every integer
+  geom_vline(xintercept = 47, linetype = "longdash", color = "darkgreen", size = 1) +
+  annotate("text", x = 47, y = max(spc_data$Cstat), label = "Signal at Week 47", 
+           hjust = 1.1, vjust = 1.1, color = "darkgreen") +
+  labs(title = "Statistical Process Control (SPC) Chart",
+       subtitle = "EWSL chart of week 37 to week 52 in year 2016",
+       x = "Weeks",
+       y = "Cstat Values",
+       caption = "Data points above the red dashed line indicate a signal") +
+  theme_minimal() +
+  guides(color = FALSE)  # Remove the color legend
+
+# Print the plot
+print(spc_plot)
+
+ggsave("#2.2016 Oct signal.pdf", plot = spc_plot, width = 12, height = 6, dpi = 500)
+
+```
+## 3D time-series plot
+
+```{r}
+# Assuming the pivot and preparation of rate_matrix is done as before
+
+# Define week 1 labels for each year explicitly
+week1_labels <- paste(2014:2020, "1", sep = "-")
+
+# Assuming the structure of your data, calculate the indices for week 1 of each year manually
+# This calculation assumes your year_week labels are continuous and start from "2014-1"
+# Adjust the starting index and step if your actual data structure differs
+week1_indices <- seq(from = 1, to = ncol(rate_matrix), by = 52) # Adjust based on your data structure
+
+# Update Plotly figure with refined axis labels
+fig <- plot_ly(z = ~rate_matrix, type = "surface",
+               colors = c('#FFEDA0','#FD8D3C', '#FC4E2A', '#E31A1C', '#BD0026', '#800026'),
+               colorbar = list(title = 'Rate'),
+               cauto = TRUE) %>%
+  layout(title = 'Influenza Rate Surface Plot',
+         scene = list(
+           xaxis = list(title = 'Year-Week', ticktext = week1_labels, tickvals = week1_indices),
+           yaxis = list(title = 'City Code'),
+           zaxis = list(title = 'Rate')))
+
+# Show the plot
+fig
+
+
+
+
+```
+
+## Individual time series plot
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+
+# Assuming 'influenza_data' is your dataframe
+
+# Create a date object from the year and week
+influenza_data$Date <- as.Date(paste(influenza_data$year, influenza_data$week, 1, sep = "-"), "%Y-%U-%w")
+
+# Filter data for Beijing and Shanghai
+beijing_data <- influenza_data %>% filter(city == "Beijing")
+shanghai_data <- influenza_data %>% filter(city == "Shanghai")
+
+# Create the plot for Beijing
+beijing_plot <- ggplot(beijing_data, aes(x = Date, y = rate)) +
+  geom_line(color = "blue") +
+  ggtitle("Beijing Influenza Rates Time Series") +
+  xlab("Year-Week") +
+  ylab("Rate") +
+  theme_minimal()
+
+# Create the plot for Shanghai
+shanghai_plot <- ggplot(shanghai_data, aes(x = Date, y = rate)) +
+  geom_line(color = "red") +
+  ggtitle("Shanghai Influenza Rates Time Series") +
+  xlab("Year-Week") +
+  ylab("Rate") +
+  theme_minimal()
+
+print(beijing_plot)
+print(shanghai_plot)
+
+
+##2014-2017
+# Filter data for Beijing and Shanghai
+beijing_data <- influenza_data %>% 
+  filter(city == "Beijing") %>%
+  filter(year == c(2014:2016))
+shanghai_data <- influenza_data %>% 
+  filter(city == "Shanghai") %>%
+  filter(year == c(2014:2016))
+
+# Create the plot for Beijing
+beijing_plot_trim <- ggplot(beijing_data, aes(x = Date, y = rate)) +
+  geom_line(color = "blue") +
+  ggtitle("Beijing Influenza Rates Time Series") +
+  xlab("Year-Week") +
+  ylab("Rate") +
+  theme_minimal()
+
+# Create the plot for Shanghai
+shanghai_plot_trim <- ggplot(shanghai_data, aes(x = Date, y = rate)) +
+  geom_line(color = "red") +
+  ggtitle("Shanghai Influenza Rates Time Series") +
+  xlab("Year-Week") +
+  ylab("Rate") +
+  theme_minimal()
+
+# Print the plots
+print(beijing_plot)
+print(shanghai_plot)
+print(beijing_plot_trim)
+print(shanghai_plot_trim)
+ggsave("Beijing.pdf", plot = beijing_plot, height = 8, width = 15, dpi = 300)
+ggsave("Beijing_trim.pdf", plot = beijing_plot_trim, height = 8, width = 12, dpi = 300)
+```
+
+## Average of all cities time series plot
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+
+# Assuming 'influenza_data' is your dataframe
+
+# Combine year and week into a single year-week column
+influenza_data$year_week <- with(influenza_data, paste(year, sprintf("%02d", week), sep = "-"))
+
+# Calculate the average, max, and min rates for each year-week across all cities
+stats_by_week <- influenza_data %>%
+  group_by(year_week) %>%
+  ##filter(year == c(2014:2017)) %>%
+  summarise(
+    average_rate = mean(rate, na.rm = TRUE),
+    max_rate = max(rate, na.rm = TRUE),
+    min_rate = min(rate, na.rm = TRUE)
+  )
+
+# Convert year-week to a Date object (assuming the week starts on Sunday)
+stats_by_week$Date <- as.Date(paste(stats_by_week$year_week, 1, sep = "-"), "%Y-%U-%w")
+
+# Create the fancy time series plot with shaded regions for max and min values
+fancy_plot <- ggplot(stats_by_week, aes(x = Date, y = average_rate)) +
+  geom_ribbon(aes(ymin = min_rate, ymax = max_rate), fill = "blue", alpha = 0.2) +
+  geom_line(color = "darkblue", size = 1) +
+  labs(
+    title = "Average Influenza Rates with Range Over Time",
+    x = "Date",
+    y = "Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+# Print the plot
+print(fancy_plot)
+
+
+####log scale
+fancy_plot <- ggplot(stats_by_week, aes(x = Date, y = average_rate)) +
+  geom_ribbon(aes(ymin = min_rate, ymax = max_rate), fill = "blue", alpha = 0.2) +
+  geom_line(color = "darkblue", size = 1) +
+  scale_y_log10() +  # Apply logarithmic scale
+  labs(
+    title = "Average Influenza Rates with Range Over Time (Log Scale)",
+    x = "Date",
+    y = "Rate (Log Scale)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 12)
+  )
+print(fancy_plot)
+####trimmed values
+# Find the 99.5th percentile for capping
+cap_value <- quantile(influenza_data$rate, .995, na.rm = TRUE)
+
+stats_by_week_trimmed <- stats_by_week %>%
+  mutate(
+    max_rate = pmin(max_rate, cap_value),
+    min_rate = pmax(min_rate, -cap_value)  # In case of negative values
+  )
+
+# Create the plot with capped values
+fancy_plot_trimmed <- ggplot(stats_by_week_trimmed, aes(x = Date, y = average_rate)) +
+  geom_ribbon(aes(ymin = min_rate, ymax = max_rate), fill = "blue", alpha = 0.2) +
+  geom_line(color = "darkblue", size = 1) +
+  labs(
+    title = "Average Influenza Rates with Trimmed Extremes",
+    x = "Date",
+    y = "Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 15),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 12)
+  )
+print(fancy_plot_trimmed)
+ggsave("Average_IR_over_time.pdf", plot = fancy_plot_trimmed)
+####seperate plots
+# Identify extreme values
+extreme_threshold <- quantile(influenza_data$rate, 0.95, na.rm = TRUE)
+extreme_data <- filter(influenza_data, rate > extreme_threshold)
+
+# Plot for extreme values
+extreme_plot <- ggplot(extreme_data, aes(x = Date, y = rate)) +
+  geom_line(color = "red", size = 1) +
+  labs(
+    title = "Extreme Influenza Rates Over Time",
+    x = "Date",
+    y = "Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 12)
+  )
+print(extreme_plot)
+```
+## The following suggests the need for a dynamic control limit...
+```{r}
+influenza_data %>%
+  filter(year == 2017| week == 33) %>%
+  summarise(mean_rate = mean(rate, na.rm = TRUE))
+influenza_data %>%
+  filter(year == 2018| week == 33) %>%
+  summarise(mean_rate = mean(rate, na.rm = TRUE))
+influenza_data %>%
+  filter(year == 2019| week == 44) %>%
+  summarise(mean_rate = mean(rate, na.rm = TRUE))
+
+```
+
+## Log scale; Large Font; OC denoted as different point shape SPC chart:
+
+```{r}
+load("/Users/zhouyuhang/Desktop/EWSL project/Codes and EWSL chart/EWSL results data/EWSL2015.RData")
+data2015 <- EWSL
+cstat_values <- data2015$cstat
+# Initialize an empty vector for the weeks
+weeks <- c()
+
+# Add weeks for 2015 from week 41 to week 52
+weeks <- c(weeks, paste("2015 week", 41:52))
+
+# Add weeks for 2016 from week 1 to week 40
+weeks <- c(weeks, paste("2016 week", 1:40))
+
+# Ensure the control limits and center line are of appropriate lengths
+cstat_values <- log(data2015$cstat)  # Assuming this transformation and data2015$cstat exist
+
+# Assuming you have a control limit value in data2015$cl
+ucl <- rep(log(mean(data2015$cl)), length(weeks))
+center_line <- rep(0, length(weeks))  # Assuming center line is at 0 for cstat
+
+# Create a data frame for ggplot, making sure it matches the length of 'weeks'
+# Adjust 'cstat_values', 'ucl', and 'center_line' as needed to match 'weeks'
+spc_data <- data.frame(Weeks = factor(weeks, levels = weeks), Cstat = cstat_values[1:length(weeks)], UCL = ucl, CenterLine = center_line)
+spc_data$NumericWeeks <- rep(1:52)
+
+plot2020 <- ggplot(spc_data, aes(x = NumericWeeks)) + 
+           geom_line(aes(y = Cstat), color = "blue") +
+           geom_hline(aes(yintercept = UCL), linetype = "dashed", color = "red") +
+
+           geom_point(data = subset(spc_data, Cstat <= UCL), aes(y = Cstat), color = "black") +
+           geom_point(data = subset(spc_data, Cstat > UCL), aes(y = Cstat), color = "red", shape = 17, size = 2) +
+           scale_color_manual(values = c("black", "red")) +
+           labs(title = "EWSL Chart: week 41, 2015 to week 40, 2016",
+                    x = "Weeks",
+                    y = "log (Charting statistics)") +
+           theme_minimal() +
+           guides(color = FALSE) +  # Remove the color legend
+           theme(text = element_text(size = 12),  # Increase text size
+                 axis.text.x = element_text(angle = 360, hjust = 0.5, vjust = 1, size = 12)) +  # Make X labels horizontal
+           scale_x_continuous(breaks = seq_along(spc_data$Weeks)[seq(1, length(spc_data$Weeks), by = 12)],
+                              labels = spc_data$Weeks[seq(1, length(spc_data$Weeks), by = 12)])  # Custom x-axis labels
+
+
+plot2020 <- plot2020 + 
+  geom_vline(xintercept = 8, linetype = "dotted", color = "black") 
+  #+ annotate("text", x = 6, y = max(spc_data$Cstat, na.rm = TRUE), label = "First signal appears at 2019 week 46", 
+  #          hjust = -0.1, vjust = -.2, color = "black", size = 3) 
+plot2020 <- plot2020 +
+  theme(
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    panel.background = element_rect(fill = "white", colour = "black")  # Optional: change the panel background to white
+  )
+
+
+plot2020
+ggsave("/Users/zhouyuhang/Desktop/EWSL project/Codes and EWSL chart/All figures with adjusted font/EWSL_2015.pdf", plot = plot2020, width = 6, height = 4)
+```
+
+
