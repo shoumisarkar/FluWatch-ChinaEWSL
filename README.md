@@ -1,4 +1,4 @@
-R codes for the spatio-temporal monitoring framework described in our paper "Online Monitoring and Early Detection of Influenza Outbreaks Using the Exponentially Weighted Spatial LASSO: A Case Study in China During 2014-2020", by Shoumi Sarkar, Yuhang Zhou, Yang Yang, Peihua Qiu.
+R codes for the spatio-temporal monitoring framework described in our paper "Online Monitoring and Early Detection of Influenza Outbreaks Using the Exponentially Weighted Spatial LASSO: A Case Study in China During 2014-2020", by Shoumi Sarkar, Yuhang Zhou, Yang Yang, Peihua Qiu (https://doi.org/10.1080/02664763.2025.2534915).
 
 `01_IR_map_panel.R` creates an aggregated map of incidence rates (IRs) for specified periods (Figure 1 in the article). This helps determine the IC and OC years.
 
