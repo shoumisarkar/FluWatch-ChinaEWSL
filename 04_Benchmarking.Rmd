@@ -1,0 +1,611 @@
+read file
+```{r}
+library(dplyr)
+data <- readxl::read_excel("/Users/jjjooo/UFL Dropbox/Yuhang Zhou/research/EWSL project/Codes and EWSL chart/Influenza.xlsx")
+data <- data[,c(1,2,4,5,6,7)]
+data <- data %>%
+  filter(year %in% c(2018,2019, 2020)) %>%
+  filter(week != 53) %>%
+  filter(
+    (year == 2018 & week >= 41) |  
+    (year == 2019) |               
+    (year == 2020 & week <= 40)    
+  )
+```
+Spatial-Temporal Bayesian Method.Span step 1 to 14.
+step1
+```{r}
+
+library(dplyr) 
+
+site_lookup <- data %>%                               
+  distinct(Lat, Long) %>%                            
+  mutate(site_id = row_number())                      
+
+m <- nrow(site_lookup)                               
+
+data <- data %>%
+  left_join(site_lookup, by = c("Lat", "Long"))
+coords <- as.matrix(site_lookup[ , c("Long", "Lat")]) 
+
+library(spdep)       
+library(geosphere)   
+k          <- 4
+nb_knn     <- knn2nb(knearneigh(coords, k = k))
+nb_knn     <- make.sym.nb(nb_knn)            
+W_knn      <- nb2mat(nb_knn, style = "B", zero.policy = TRUE)
+radius_km  <- 30
+nb_band    <- dnearneigh(coords, 0, radius_km, longlat = TRUE)
+W_band     <- nb2mat(nb_band, style = "B", zero.policy = TRUE)
+nb_del     <- tri2nb(coords)
+W_del      <- nb2mat(nb_del, style = "B", zero.policy = TRUE)
+W <- W_knn          
+
+```
+step 2,3
+```{r}
+library(dplyr)
+library(tidyr)
+time_lookup <- data %>%
+  distinct(year, week) %>%              
+  arrange(year, week) %>%               
+  mutate(time_id = row_number())        
+
+T <- nrow(time_lookup)
+m <- nrow(site_lookup)
+full_grid <- tidyr::crossing(           
+                site_id    = site_lookup$site_id,
+                time_lookup) %>%        
+  left_join(data,
+            by = c("site_id", "year", "week")) %>%
+  mutate(n = tidyr::replace_na(n, 0)) %>%
+  arrange(time_id, site_id)             
+
+stopifnot(nrow(full_grid) == T * m)     
+Y <- matrix(full_grid$n, nrow = T, ncol = m, byrow = TRUE)
+pop_col <- NULL
+if ("population_2020" %in% names(site_lookup)) pop_col <- "population_2020"
+if (is.null(pop_col) && "population" %in% names(site_lookup)) pop_col <- "population"
+
+have_pop <- !is.null(pop_col) &&
+            suppressWarnings(!anyNA(as.numeric(site_lookup[[pop_col]])))
+
+if (have_pop) {
+  K <- 2                                  
+} else {
+  K <- 1
+  message("Using intercept-only covariates (no numeric population field).")
+}
+X.mu  <- array(NA_real_, dim = c(T, m, K))
+X.lam <- array(NA_real_, dim = c(T, m, K))
+X.mu[, , 1]  <- 1
+X.lam[, , 1] <- 1
+if (K == 2) {
+  log_pop <- log(as.numeric(site_lookup[[pop_col]]))
+  X.mu[, , 2]  <- matrix(rep(log_pop, each = T), nrow = T, byrow = FALSE)
+  X.lam[, , 2] <- X.mu[, , 2]
+}
+stopifnot(dim(Y) == c(T, m),
+          all.equal(dim(X.mu), dim(X.lam)),
+          dim(X.mu)[1:2] == c(T, m))
+
+message("Step 2 complete — Y: ", T, "×", m,
+        "; covariates K = ", K, ".")
+
+```
+split training and monitor:
+```{r}
+train_weeks <- time_lookup %>%
+  filter(  (year == 2018 & week >= 41) |
+           (year == 2019 & week <= 40) )   
+
+monitor_weeks <- time_lookup %>%
+  filter(  (year == 2019 & week >= 41) |
+           (year == 2020 & week <= 40) )
+
+train_id <- train_weeks$time_id           
+mon_id   <- monitor_weeks$time_id
+Y_train <- Y[train_id, , drop = FALSE]    
+Y_mon   <- Y[mon_id,   , drop = FALSE]    
+Xmu_train  <- X.mu [train_id, , , drop = FALSE]
+Xmu_mon    <- X.mu [mon_id,   , , drop = FALSE]
+
+Xlam_train <- X.lam[train_id, , , drop = FALSE]
+Xlam_mon   <- X.lam[mon_id,   , , drop = FALSE]
+train_id <- which(time_lookup$time_id %in% train_weeks$time_id)
+mon_id   <- which(time_lookup$time_id %in% monitor_weeks$time_id)
+
+Y_train      <- Y      [train_id, , drop = FALSE]
+Xmu_train    <- X.mu   [train_id, , , drop = FALSE]
+Xlam_train   <- X.lam  [train_id, , , drop = FALSE]
+
+Y_monitor    <- Y      [mon_id, , drop = FALSE]
+Xmu_monitor  <- X.mu   [mon_id, , , drop = FALSE]
+Xlam_monitor <- X.lam  [mon_id, , , drop = FALSE]
+
+```
+step4-8
+```{r}
+library(nimble)
+
+code_model <- nimbleCode({
+  beta_mu[1]  ~ dnorm(0, sd = 100)
+  beta_lam[1] ~ dnorm(0, sd = 100)
+  rho1        ~ dunif(0, 1)
+  rho2        ~ dunif(0, 1)
+  tau2        ~ dinvgamma(1, 0.01)
+  p_s         ~ dbeta(1, 1)
+  p_o         ~ dbeta(1, 1)
+  xi[1, 1:m] ~ dcar_normal(adj[1:L], weights[1:L], num[1:m],
+                          tau = 1 / tau2, zero_mean = 1)
+  for (t in 2:T) {
+    xi_raw[t, 1:m] ~ dcar_normal(adj[1:L], weights[1:L], num[1:m],
+                                 tau = 1 / tau2, zero_mean = 1)
+    for (i in 1:m) {
+      xi[t, i] <- rho2 * xi[t - 1, i] + xi_raw[t, i]
+    }
+  }
+  for (t in 1:T) {
+    for (i in 1:m) {
+      log_mu[t, i]     <- beta_mu[1]  * X_mu[t, i, 1]  + xi[t, i]
+      log_lambda[t, i] <- beta_lam[1] * X_lam[t, i, 1] + xi[t, i]
+      mu[t, i]         <- exp(log_mu[t, i])
+      lambda[t, i]     <- exp(log_lambda[t, i])
+    }
+  }
+  for (i in 1:m) {
+    delta[1, i] ~ dbern(0.01)
+  }
+  for (t in 2:T) {
+    for (i in 1:m) {
+      zero_neigh[t, i] <- equals(neigh_infected[t, i], 0)
+      q[t, i] <- (1 - delta[t - 1, i]) * (
+                    p_s * zero_neigh[t, i] +
+                    (1 - pow(1 - p_o, neigh_infected[t, i])) * (1 - zero_neigh[t, i])
+                 ) + delta[t - 1, i] * 0.999
+      delta[t, i] ~ dbern(q[t, i])
+    }
+  }
+  for (t in 1:T) {
+    for (i in 1:m) {
+      mean_Y[t, i] <- mu[t, i] + delta[t, i] * lambda[t, i]
+      Y[t, i] ~ dpois(mean_Y[t, i])
+    }
+  }
+})
+
+
+
+```
+step9-11
+```{r}
+library(spdep)
+T_train <- nrow(Y_train)
+neigh_infected_mat <- matrix(0, T_train, m)
+for (t in 2:T_train) {
+  for (i in 1:m) {
+    neighbors <- which(W[i, ] == 1)
+    neigh_infected_mat[t, i] <- sum(Y_train[t - 1, neighbors] > 0)
+  }
+}
+
+library(spdep)
+WB <- nb2WB(mat2listw(W, style = "B")$neighbours)
+
+constants <- list(
+  T = T_train,
+  m = m,
+  K = K,
+  L = length(WB$adj)
+)
+
+data_list <- list(
+  Y              = Y_train,
+  X_mu           = Xmu_train,
+  X_lam          = Xlam_train,
+  adj            = WB$adj,
+  weights        = WB$weights,
+  num            = WB$num,
+  neigh_infected = neigh_infected_mat
+)
+
+inits <- function() {
+  list(
+    beta_mu  = rnorm(K, 0, 0.1),
+    beta_lam = rnorm(K, 0, 0.1),
+    rho1     = 0.1,
+    rho2     = 0.1,
+    tau2     = 1,
+    p_s      = 0.01,
+    p_o      = 0.2,
+    xi       = matrix(0, T_train, m),
+    xi_raw   = matrix(0, T_train, m),
+    delta    = matrix(0, T_train, m)
+  )
+}
+
+
+```
+step12,13
+```{r}
+Rmodel <- nimbleModel(code = code_model,
+                      constants = constants,
+                      data = data_list,
+                      inits = inits(),
+                      check = FALSE)
+
+Cmodel <- compileNimble(Rmodel)
+printErrors()
+
+conf <- configureMCMC(Cmodel, monitors = c(
+  "beta_mu", "beta_lam", "rho1", "rho2", "tau2",
+  "p_s", "p_o", "xi", "delta"
+))
+
+conf$removeSamplers(c("rho1", "rho2"))
+conf$addSampler(target = "rho1", type = "slice")
+conf$addSampler(target = "rho2", type = "slice")
+
+Rmcmc <- buildMCMC(conf)
+Cmcmc <- compileNimble(Rmcmc, project = Cmodel)
+
+set.seed(123)
+samples <- runMCMC(Cmcmc,
+                   niter = 10000,
+                   nburnin = 5000,
+                   thin = 10,
+                   nchains = 1,
+                   samplesAsCodaMCMC = TRUE,
+                   summary = TRUE)
+
+summary(samples)
+
+
+```
+step14
+```{r}
+T_monitor <- nrow(Xmu_monitor)
+log_mu_monitor     <- matrix(NA, nrow = T_monitor, ncol = m)
+log_lambda_monitor <- matrix(NA, nrow = T_monitor, ncol = m)
+mu_monitor         <- matrix(NA, nrow = T_monitor, ncol = m)
+lambda_monitor     <- matrix(NA, nrow = T_monitor, ncol = m)
+q_monitor          <- matrix(NA, nrow = T_monitor, ncol = m)
+delta_monitor      <- matrix(0, nrow = T_monitor, ncol = m)
+xi_monitor         <- matrix(0, nrow = T_monitor, ncol = m)
+xi_monitor[1, ]    <- xi_hat[T_train, ]
+
+for (t in 1:T_monitor) {
+  for (i in 1:m) {
+    log_mu_monitor[t, i]     <- beta_mu_hat  * Xmu_monitor[t, i, 1]  + xi_monitor[t, i]
+    log_lambda_monitor[t, i] <- beta_lam_hat * Xlam_monitor[t, i, 1] + xi_monitor[t, i]
+    mu_monitor[t, i]         <- exp(log_mu_monitor[t, i])
+    lambda_monitor[t, i]     <- exp(log_lambda_monitor[t, i])
+  }
+}
+T_monitor <- nrow(Y_monitor)
+neigh_infected_monitor <- matrix(0, T_monitor, m)
+for (t in 2:T_monitor) {
+  for (i in 1:m) {
+    neighbors <- which(W[i, ] == 1)
+    neigh_infected_monitor[t, i] <- sum(Y_monitor[t - 1, neighbors] > 0)
+  }
+}
+
+delta_monitor[1, ] <- 0
+for (t in 2:T_monitor) {
+  for (i in 1:m) {
+    zero_neigh <- as.numeric(neigh_infected_monitor[t, i] == 0)
+    q_monitor[t, i] <- (1 - delta_monitor[t - 1, i]) * (
+                         p_s_hat * zero_neigh +
+                         (1 - (1 - p_o_hat)^neigh_infected_monitor[t, i]) * (1 - zero_neigh)
+                       ) + delta_monitor[t - 1, i] * 0.999
+
+    delta_monitor[t, i] <- q_monitor[t, i]
+  }
+}
+
+alarm_threshold <- 0.95
+alarm_matrix <- (delta_monitor > alarm_threshold)
+
+```
+monitoring result
+```{r}
+find_first_signal <- function(delta_monitor, threshold = 0.8, days = 2) {
+  T_monitor <- nrow(delta_monitor)
+  m <- ncol(delta_monitor)
+  signal_time <- rep(NA_integer_, m)
+
+  for (j in 1:m) {
+    exceeds <- delta_monitor[, j] > threshold
+    if (T_monitor >= days) {
+      run_sum <- stats::filter(exceeds, rep(1, days), sides = 1)
+      first_signal <- which(run_sum == days)[1]
+      if (!is.na(first_signal)) {
+        signal_time[j] <- first_signal - days + 1
+      }
+    }
+  }
+  return(signal_time)
+}
+
+
+first_signal_vec <- find_first_signal(delta_monitor, threshold = 0.9, days = 1)
+ind <- which(first_signal_vec == 10)[1]
+specific <- delta_monitor[,ind]
+library(ggplot2)
+
+n_points <- length(specific)
+Weeks <- seq_len(n_points)
+CL <- 0.9
+
+spc_data <- data.frame(
+  Weeks = Weeks,
+  Cstat = specific,
+  UCL = CL,
+  above_ucl = specific > CL
+)
+
+signal_index <- which(spc_data$above_ucl)[1]
+signal_week <- spc_data$Weeks[signal_index]
+
+pdf("specific_monitoring_chart.pdf", width = 5, height = 3)
+
+ggplot(spc_data, aes(x = Weeks, y = Cstat)) +
+  geom_hline(yintercept = CL, linetype = "dashed", color = "red") +
+  geom_line(color = "blue") +
+  geom_point(
+    data = subset(spc_data, !above_ucl), 
+    aes(x = Weeks, y = Cstat),
+    color = "black", shape = 16, size = 2
+  ) +
+  geom_point(
+    data = subset(spc_data, above_ucl), 
+    aes(x = Weeks, y = Cstat),
+    color = "red", shape = 17, size = 2
+  ) +
+  {if (!is.na(signal_week)) geom_vline(xintercept = signal_week, linetype = "dotted", color = "black")} +
+  theme_void() +
+  theme(plot.margin = margin(5, 5, 5, 5))
+
+dev.off()
+
+```
+Temporal LM CUSUM model
+```{r}
+library(dplyr)
+
+LM <- data %>%
+  select(year, week, n) %>%
+  group_by(year, week) %>%
+  summarize(n = sum(n), .groups = 'drop') %>%
+  as.data.frame()
+LM_IC <- LM[c(1:52),]
+LM_OC <- LM[c(53:104),]
+
+mod <- lm(n ~ week + I(week^2), data = LM_IC)
+predicted_n <- predict(mod, newdata = LM_OC)
+results <- data.frame(actual = LM_OC$n, predicted = predicted_n)
+IC_pred <- predict(mod, newdata = LM_IC)
+
+
+
+
+
+set.seed(123)
+B <- 1000
+sample_size <- 400
+n_data <- length(IC_pred)
+
+boot_indices <- replicate(B, sample(seq_len(n_data), size = sample_size, replace = TRUE))
+run_length <- function(idx, LM_IC_n, IC_pred, h, k = 0.3) {
+  C <- 0
+  for (i in seq_along(idx)) {
+    x <- LM_IC_n[idx[i]]
+    mu <- IC_pred[idx[i]]
+    C <- max(0, C + (x - mu - k))
+    if (C > h) return(i)
+  }
+  return(length(idx))
+}
+
+avg_run_length <- function(h, LM_IC_n, IC_pred, boot_indices, k = 0) {
+  rl <- apply(boot_indices, 2, run_length, LM_IC_n = LM_IC_n, IC_pred = IC_pred, h = h, k = k)
+  mean(rl)
+}
+
+target_arl <- 200
+tol <- 1
+h_low <- 0
+h_high <- 500000
+max_iter <- 50
+
+for (iter in 1:max_iter) {
+  h_mid <- (h_low + h_high) / 2
+  arl_mid <- avg_run_length(h_mid, LM_IC$n, IC_pred, boot_indices)
+  
+  cat("Iter", iter, ": h =", h_mid, ", ARL =", arl_mid, "\n")
+  
+  if (abs(arl_mid - target_arl) < tol) {
+    break
+  } else if (arl_mid < target_arl) {
+    h_low <- h_mid
+  } else {
+    h_high <- h_mid
+  }
+}
+
+cat("Estimated control limit h =", h_mid, "with ARL ≈", arl_mid, "\n")
+
+
+CL <- h_mid
+
+k <- 0.3
+n_obs <- nrow(results)
+cusum <- numeric(n_obs)
+signal_time <- NA
+
+for (t in 1:n_obs) {
+  if (t == 1) {
+    cusum[t] <- max(0, results$actual[t] - results$predicted[t] - k)
+  } else {
+    cusum[t] <- max(0, cusum[t-1] + results$actual[t] - results$predicted[t] - k)
+  }
+  if (is.na(signal_time) && cusum[t] > CL) {
+    signal_time <- t  
+  }
+}
+
+results$CUSUM <- cusum
+cat("First signal occurs at time:", signal_time, "\n")
+
+setwd("/Users/jjjooo/UFL Dropbox/Yuhang Zhou/research/EWSL paper supplement")
+library(ggplot2)
+spc_data <- data.frame(
+  Weeks = results$Weeks,
+  Cstat = results$CUSUM,
+  UCL = CL
+)
+spc_data$above_ucl <- spc_data$Cstat > CL
+
+signal_index <- which(spc_data$above_ucl)[1]
+signal_week <- spc_data$Weeks[signal_index]
+pdf("cusum_minimal_plot.pdf", width = 5, height = 3)
+
+ggplot(spc_data, aes(x = Weeks, y = Cstat)) +
+  geom_hline(yintercept = CL, linetype = "dashed", color = "red") +
+  geom_line(color = "blue") +
+  geom_point(
+    data = subset(spc_data, !above_ucl), 
+    aes(x = Weeks, y = Cstat),
+    color = "black", shape = 16, size = 2
+  ) +
+  geom_point(
+    data = subset(spc_data, above_ucl), 
+    aes(x = Weeks, y = Cstat),
+    color = "red", shape = 17, size = 2
+  ) +
+  {if (!is.na(signal_week)) geom_vline(xintercept = signal_week, linetype = "dotted", color = "black")} +
+  theme_void() +
+  theme(plot.margin = margin(5, 5, 5, 5))
+
+dev.off()
+
+
+
+
+```
+Figure 2
+```{r}
+set.seed(123)
+time <- 1:100
+true_val <- 12 * sin(time / 12) + 0.03 * (time - 70) + 1.5
+obs <- true_val + rnorm(length(time), sd = 4)
+ksmooth_result <- ksmooth(time, obs, kernel = "normal", bandwidth = 8)
+pdf("/Users/jjjooo/UFL Dropbox/Yuhang Zhou/research/EWSL paper supplement/Temporal_smooth.pdf", width = 5, height = 5)
+
+
+par(
+  pty = "s",             
+  mgp = c(1, 0.3, 0),    
+  tcl = -0.2,            
+  mar = c(2.5, 2.5, 1, 1)
+)
+
+plot(
+  time, obs, 
+  pch = 20,            
+  col = "blue",         
+  xlab = "Time",        
+  ylab = "Value",       
+  xlim = c(1, 100),     
+  ylim = range(c(obs, ksmooth_result$y)), 
+  cex = 0.5,            
+  asp = 1,              
+  cex.lab = 1.3,        
+  cex.axis = 0.8        
+
+)
+
+
+lines(ksmooth_result, col = "red", lwd = 2)
+legend(
+  "topleft", inset = 0.02,        
+  legend = c("Observations", "Smoothed values"),
+  col = c("blue", "red"),         
+  pch = c(20, NA),                
+  lty = c(NA, 1),                
+  lwd = c(NA, 2),                 
+  box.lwd = 1.2,                  
+  box.col = "black",             
+  bg = "white",                   
+  cex = 1.2                       
+)
+
+dev.off()  
+
+
+
+```
+Figure 3 Left plot
+```{r}
+library(fields)    
+
+set.seed(124)
+mat <- matrix(0, 10, 10)
+mat[5:6, 4:7] <- runif(2 * 4, min = 0.2, max = 0.75)   
+mat[4:7, 5:6] <- runif(4 * 2, min = 0.2, max = 0.75)   
+mat[5:6, 5:6] <- runif(2 * 2, min = 0.7, max = 0.9)
+idx <- sample(length(mat), 20)
+mat[idx] <- mat[idx] + runif(20, min = 0, max = 0.25)
+mat[mat > 1] <- 1
+
+par(pty = "s")
+colfunc <- colorRampPalette(c("white", "firebrick"))
+mycols <- colfunc(100)
+fields::image.plot(
+  1:10, 1:10, t(mat[nrow(mat):1, ]),
+  col = mycols,
+  xlab = "", ylab = "",
+  axes = FALSE,
+  asp = 1,
+  legend.lab = " ",      
+  legend.line = 2,               
+  legend.width = 1.2             
+)
+
+for (i in 0:10) {
+  segments(i + 0.5, 0.5, i + 0.5, 10.5, col = "grey30", lwd = 1.2)
+  segments(0.5, i + 0.5, 10.5, i + 0.5, col = "grey30", lwd = 1.2)
+}
+
+points(5.5, 5.5, pch = 4, col = "blue", cex = 2, lwd = 2)
+
+
+
+
+```
+Figure 3 right plot
+```{r}
+set.seed(124)  
+mat <- matrix(0, 10, 10)
+mat[5:6, 5:6] <- runif(4, min = 0.7, max = 1)
+mat[c(4,7), 5:6] <- runif(4, min = 0.2, max = 0.4)
+mat[5:6, c(4,7)] <- runif(4, min = 0.2, max = 0.5)
+par(pty = "s")
+colfunc <- colorRampPalette(c("white", "firebrick"))
+image(
+  1:10, 1:10, t(mat[nrow(mat):1, ]),
+  col = colfunc(100),           
+  xlab = "", ylab = "",
+  axes = FALSE, asp = 1
+)
+
+for (i in 0:10) {
+  segments(i + 0.5, 0.5, i + 0.5, 10.5, col = "grey30", lwd = 1.2)
+  segments(0.5, i + 0.5, 10.5, i + 0.5, col = "grey30", lwd = 1.2)
+}
+points(5.5, 5.5, pch = 4, col = "blue", cex = 2, lwd = 2)
+box()
+
+
+```
