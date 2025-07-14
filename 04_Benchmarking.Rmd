@@ -1,7 +1,7 @@
 read file
 ```{r}
 library(dplyr)
-data <- readxl::read_excel("/Users/jjjooo/UFL Dropbox/Yuhang Zhou/research/EWSL project/Codes and EWSL chart/Influenza.xlsx")
+data <- readxl::read_excel("/folder/Influenza.xlsx")
 data <- data[,c(1,2,4,5,6,7)]
 data <- data %>%
   filter(year %in% c(2018,2019, 2020)) %>%
